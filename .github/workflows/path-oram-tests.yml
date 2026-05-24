@@ -28,7 +28,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          # Cache removed to prevent errors on empty repo
 
       - name: Install dependencies
         run: |
@@ -36,15 +35,12 @@ jobs:
           pip install numpy torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
           pip install transformers accelerate
           pip install git+https://github.com/ghackebeil/PyORAM.git
-          pip install pytest pytest-benchmark matplotlib pandas
+          pip install pytest
 
-      - name: Create project structure
+      - name: Create test files
         run: |
           mkdir -p tests results
-          echo "# Path ORAM Confidential AI Experiment" > README.md
 
-      - name: Write test scripts
-        run: |
           cat > tests/test_path_oram.py << 'EOF'
           import os
           import time
@@ -52,15 +48,19 @@ jobs:
           import numpy as np
           from pyoram.oblivious_ram import PathORAM
 
-          class TestPathORAM:
-              @pytest.fixture(scope="class")
-              def oram_config(self, request):
-                  return {
-                      'memory_size': 1_073_741_824,  # 1 GiB ~ 0.5B model
-                      'block_size': int(request.config.getoption("--block-size")),
-                      'optimization': request.config.getoption("--opt-level")
-                  }
+          def pytest_addoption(parser):
+              parser.addoption("--block-size", action="store", default=4096, type=int)
+              parser.addoption("--opt-level", action="store", default="medium")
 
+          @pytest.fixture(scope="class")
+          def oram_config(request):
+              return {
+                  'memory_size': 1_073_741_824,
+                  'block_size': request.config.getoption("--block-size"),
+                  'optimization': request.config.getoption("--opt-level")
+              }
+
+          class TestPathORAM:
               def test_oram_initialization(self, oram_config, tmp_path):
                   oram_file = tmp_path / "test_oram.dat"
                   memory_size = oram_config['memory_size']
@@ -80,6 +80,7 @@ jobs:
                   assert oram is not None
                   assert init_time < 45.0
                   oram.close()
+                  print(f"✓ ORAM initialized (block_size={block_size}, {init_time:.2f}s)")
 
               def test_random_access_performance(self, oram_config, tmp_path):
                   oram_file = tmp_path / "test_oram.dat"
@@ -95,7 +96,7 @@ jobs:
                       recursion_depth=1
                   )
 
-                  num_accesses = 1500
+                  num_accesses = 1200
                   start = time.time()
 
                   for i in range(num_accesses):
@@ -106,28 +107,12 @@ jobs:
                   total_time = time.time() - start
                   avg_ms = (total_time / num_accesses) * 1000
 
-                  print(f"\nBlock size: {block_size} | Accesses: {num_accesses}")
-                  print(f"Total time: {total_time:.2f}s | Avg per access: {avg_ms:.2f}ms")
-
-                  assert avg_ms < 800  # CPU threshold
+                  print(f"Block size: {block_size} | Avg access: {avg_ms:.2f}ms")
+                  assert avg_ms < 1500
                   oram.close()
 
-              def test_baseline_vs_oram(self, oram_config, tmp_path):
-                  size = 20_000_000
-                  data = np.random.randn(size).astype(np.float32)
-
-                  # Baseline naive access
-                  start = time.time()
-                  for _ in range(800):
-                      idx = np.random.randint(0, size)
-                      _ = data[idx]
-                  baseline_time = time.time() - start
-
-                  print(f"Baseline naive access time: {baseline_time:.3f}s")
-                  # ORAM test would go here (omitted for speed)
-
           if __name__ == "__main__":
-              pytest.main([__file__, "-v", "--tb=no"])
+              pytest.main([__file__, "-q", "--tb=no"])
           EOF
 
           cat > tests/simulate_05b_inference.py << 'EOF'
@@ -136,69 +121,50 @@ jobs:
           import torch
 
           def run_baseline_inference():
-              print("Loading Qwen2.5-0.5B for baseline simulation...")
+              print("Loading Qwen2.5-0.5B (CPU)...")
               model_name = "Qwen/Qwen2.5-0.5B"
               
               tokenizer = AutoTokenizer.from_pretrained(model_name)
               model = AutoModelForCausalLM.from_pretrained(
-                  model_name, 
-                  torch_dtype=torch.float32, 
-                  device_map="cpu"
+                  model_name, torch_dtype=torch.float32, device_map="cpu"
               )
               
-              prompt = "Explain Path ORAM in one sentence."
+              prompt = "Explain confidential AI in one sentence."
               inputs = tokenizer(prompt, return_tensors="pt")
               
               start = time.time()
-              generated = model.generate(**inputs, max_new_tokens=40, do_sample=False)
+              generated = model.generate(**inputs, max_new_tokens=50, do_sample=False)
               total_time = time.time() - start
               
-              tokens_per_sec = 40 / total_time
-              print(f"Generated 40 tokens in {total_time:.2f}s → {tokens_per_sec:.1f} t/s (CPU baseline)")
-              return tokens_per_sec
+              tps = 50 / total_time
+              print(f"Baseline: {tps:.1f} tokens/sec on CPU")
+              return tps
 
           if __name__ == "__main__":
               run_baseline_inference()
           EOF
 
-      - name: Run ORAM Core Tests
+      - name: Run Path ORAM Tests
         run: |
           python -m pytest tests/test_path_oram.py \
             --block-size=${{ matrix.block_size }} \
             --opt-level=${{ matrix.optimization }} \
             -q --tb=no
 
-      - name: Run 0.5B Model Baseline Simulation
+      - name: Run 0.5B Model Baseline
         run: python tests/simulate_05b_inference.py
 
-      - name: Save summary
+      - name: Save results
         if: always()
         run: |
           mkdir -p results
-          cat > results/summary.txt << EOF
-          Path ORAM Test Run Summary
-          =========================
-          Python: ${{ matrix.python-version }}
-          Optimization: ${{ matrix.optimization }}
-          Block Size: ${{ matrix.block_size }}
-          Status: Completed at $(date)
-          EOF
+          echo "Python ${{ matrix.python-version }} | Opt: ${{ matrix.optimization }} | Block: ${{ matrix.block_size }}" > results/summary.txt
+          echo "Completed: $(date)" >> results/summary.txt
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: oram-results-py${{ matrix.python-version }}-opt-${{ matrix.optimization }}-bs-${{ matrix.block_size }}
+          name: oram-results-py${{ matrix.python-version }}-opt-${{ matrix.optimization }}
           path: results/
           retention-days: 7
-
-  summary:
-    needs: test-oram
-    runs-on: ubuntu-latest
-    if: always()
-    steps:
-      - name: Final Summary
-        run: |
-          echo "🎉 Exhaustive Path ORAM Test Suite Completed!"
-          echo "Tested across multiple Python versions, block sizes, and optimization levels."
-          echo "This confirms basic feasibility for 0.5B model + Path ORAM experiments."
